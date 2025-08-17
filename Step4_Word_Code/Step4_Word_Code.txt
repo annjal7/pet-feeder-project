@@ -1,0 +1,115 @@
+STEP 4 – WORD CODE (Plain‑English Pseudocode, FINAL RECOMMENDED)
+------------------------------------------------------------------
+SECTION A – SETUP (RUN ONCE AT START)
+------------------------------------------------------------------
+1) Configuration
+   FEED_TIMES = [08:00, 18:00]                 // two daily feeds
+   TIME_WINDOW_MIN = 1                         // allow ±1 min window to trigger
+   PET_PROFILES = {
+     "cat": { portion_g: 80,  consumed_min_pct: 50 },
+     "dog": { portion_g: 100, consumed_min_pct: 50 }
+   }
+   HOPPER_LOW_PCT = 15                         // low food warning threshold
+   BOWL_CAPACITY_G = 600                       // physical bowl capacity
+   SAFETY_MARGIN_G = 50                        // avoid overfill
+   NO_EAT_WINDOW_MIN = 10                      // wait time to check consumption
+   MIN_IMMEDIATE_DELTA_G = 5                   // small increase confirms drop
+   MAX_DISPENSE_RETRIES = 1                    // 1 retry after first attempt
+
+2) State
+   lastFeedLog = []                            // {date, time, pet, grams}
+   alertActive = false
+   tareBowl()                                  // zero/initialize the scale
+
+3) Helper functions
+   now() -> HH:MM
+   isWithinWindow(time, FEED_TIMES, windowMin) -> bool
+   readHopperPercent() -> 0..100               // hopper/container level
+   readBowlGrams() -> integer grams            // weight of bowl contents
+   sensorsHealthy() -> bool                    // checks for NaN/negative/out-of-range
+   rotateServo(portions)                       // opens gate for N drops
+   sendAlert(message)                          // buzzer/LED/app
+   logEvent(obj)                               // persist to file/cloud
+   safeReducePortion(target_g, current_bowl_g) -> grams
+       // returns grams that keep bowl <= (BOWL_CAPACITY_G - SAFETY_MARGIN_G)
+
+------------------------------------------------------------------
+SECTION B – MAIN LOOP (RUN FOREVER)
+------------------------------------------------------------------
+LOOP forever:
+   IF NOT sensorsHealthy() THEN
+       sendAlert("Sensor error – feeding paused")
+       logEvent({ t: now(), status: "sensor_error" })
+       WAIT 5 minutes
+       CONTINUE
+   ENDIF
+
+   IF isWithinWindow(now(), FEED_TIMES, TIME_WINDOW_MIN) THEN
+       FOR each pet in PET_PROFILES:
+           feedNow(pet)
+       ENDFOR
+       WAIT 60 seconds   // avoid double-triggering within the window
+   ELSE
+       SLEEP 5 seconds
+   ENDIF
+ENDLOOP
+
+------------------------------------------------------------------
+SECTION C – FEED ROUTINE
+------------------------------------------------------------------
+FUNCTION feedNow(pet):
+   profile = PET_PROFILES[pet]
+   portionG = profile.portion_g
+   minConsumedG = CEIL(profile.consumed_min_pct / 100 * portionG)
+
+   // 1) Pre‑checks
+   IF readHopperPercent() < HOPPER_LOW_PCT THEN
+       sendAlert("Low hopper level – refill required")
+       logEvent({ t: now(), pet, status: "low_hopper" })
+       RETURN
+   ENDIF
+
+   bowlBefore = readBowlGrams()
+   portionSafe = safeReducePortion(portionG, bowlBefore)
+   IF portionSafe <= 0 THEN
+       sendAlert("Bowl near capacity – feeding skipped")
+       logEvent({ t: now(), pet, status: "bowl_full" })
+       RETURN
+   ENDIF
+
+   // 2) Dispense with jam detection and 1 retry
+   attempts = 0
+   dispensedOk = false
+   WHILE attempts <= MAX_DISPENSE_RETRIES AND NOT dispensedOk:
+       attempts += 1
+       rotateServo(portionSafe)                // perform dispense
+       WAIT 2 seconds                          // settle
+       bowlAfter = readBowlGrams()
+
+       IF (bowlAfter - bowlBefore) >= MIN_IMMEDIATE_DELTA_G THEN
+           dispensedOk = true
+       ELSE
+           IF attempts <= MAX_DISPENSE_RETRIES THEN
+               logEvent({ t: now(), pet, status: "jam_retry" })
+           ENDIF
+       ENDIF
+   ENDWHILE
+
+   IF NOT dispensedOk THEN
+       sendAlert("Dispense failed – possible jam")
+       logEvent({ t: now(), pet, status: "dispense_failed" })
+       RETURN
+   ENDIF
+
+   // 3) Consumption window
+   WAIT NO_EAT_WINDOW_MIN minutes
+   bowlWindow = readBowlGrams()
+   eatenG = bowlWindow - bowlAfter
+
+   IF eatenG >= minConsumedG THEN
+       logEvent({ t: now(), pet, status: "eaten", grams: portionSafe })
+   ELSE
+       sendAlert("Pet not eating")
+       logEvent({ t: now(), pet, status: "not_eating", grams: portionSafe })
+   ENDIF
+END FUNCTION
